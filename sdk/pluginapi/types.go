@@ -492,6 +492,9 @@ const (
 	SchedulerBuiltinRoundRobin = "round-robin"
 	// SchedulerBuiltinFillFirst delegates auth selection to the built-in fill-first scheduler.
 	SchedulerBuiltinFillFirst = "fill-first"
+	// SchedulerBuiltinSoonestResetFirst delegates auth selection to the built-in
+	// soonest-reset-first scheduler.
+	SchedulerBuiltinSoonestResetFirst = "soonest-reset-first"
 	// SelectionIDMetadataKey is the metadata key carrying the per-selection identifier in SchedulerOptions.Metadata.
 	SelectionIDMetadataKey = "selection_id"
 )

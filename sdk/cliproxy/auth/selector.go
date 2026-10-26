@@ -71,6 +71,13 @@ func weightedSelectorStateModel(ctx context.Context, availabilityModel string) s
 // rolling-window subscription caps (e.g. chat message limits).
 type FillFirstSelector struct{}
 
+// SoonestResetFirstSelector burns the credential whose quota window resets
+// soonest. Capacity still unused when a window resets is lost, so draining the
+// earliest-resetting credential first wastes the least. Credentials without an
+// observed reset rank after known ones (an untouched window has not started its
+// clock yet), exhausted credentials rank last, and ties keep ID order.
+type SoonestResetFirstSelector struct{}
+
 type blockReason int
 
 const (
@@ -818,6 +825,92 @@ func (s *FillFirstSelector) Pick(ctx context.Context, provider, model string, op
 	}
 	available = preferCodexWebsocketAuths(ctx, provider, available)
 	return available[0], nil
+}
+
+// Pick selects the available auth whose quota window resets soonest.
+func (s *SoonestResetFirstSelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
+	_ = opts
+	now := time.Now()
+	available, err := getSelectorAvailableAuths(ctx, auths, provider, model, now)
+	if err != nil {
+		return nil, err
+	}
+	available = preferCodexWebsocketAuths(ctx, provider, available)
+	var picked *Auth
+	var pickedRank soonestResetRank
+	for _, candidate := range available {
+		if candidate == nil {
+			continue
+		}
+		rank := soonestResetRankForAuth(candidate, now)
+		if picked == nil || rank.before(pickedRank) {
+			picked = candidate
+			pickedRank = rank
+		}
+	}
+	if picked == nil {
+		return nil, &Error{Code: "auth_not_found", Message: "no auth available"}
+	}
+	return picked, nil
+}
+
+const (
+	soonestResetTierKnown = iota
+	soonestResetTierUnknown
+	soonestResetTierExhausted
+)
+
+// soonestResetRank orders credentials for soonest-reset-first routing.
+type soonestResetRank struct {
+	tier    int
+	resetAt time.Time
+}
+
+func (r soonestResetRank) before(other soonestResetRank) bool {
+	if r.tier != other.tier {
+		return r.tier < other.tier
+	}
+	return r.resetAt.Before(other.resetAt)
+}
+
+// SoonestResetFirstRank exposes the soonest-reset-first ordering key of auth.
+// Tier is "known", "unknown", or "exhausted"; lower tiers are preferred, and
+// within a tier the earlier resetAt wins.
+func SoonestResetFirstRank(auth *Auth, now time.Time) (tier string, resetAt time.Time) {
+	rank := soonestResetRankForAuth(auth, now)
+	switch rank.tier {
+	case soonestResetTierKnown:
+		return "known", rank.resetAt
+	case soonestResetTierExhausted:
+		return "exhausted", rank.resetAt
+	default:
+		return "unknown", rank.resetAt
+	}
+}
+
+// soonestResetRankForAuth ranks auth by the reset of its longest quota window.
+// A credential with any window already used up ranks as exhausted until that
+// window refills.
+func soonestResetRankForAuth(auth *Auth, now time.Time) soonestResetRank {
+	if auth == nil {
+		return soonestResetRank{tier: soonestResetTierUnknown}
+	}
+	windows := QuotaWindowsFromState(auth.Provider, auth.Quota)
+	rank := soonestResetRank{tier: soonestResetTierUnknown}
+	exhausted := false
+	for i := len(windows) - 1; i >= 0; i-- {
+		window := windows[i].RolledForward(now)
+		if window.UsedPercent >= 100 && window.ResetAt.After(now) {
+			exhausted = true
+		}
+		if rank.tier == soonestResetTierUnknown && !window.ResetAt.IsZero() {
+			rank = soonestResetRank{tier: soonestResetTierKnown, resetAt: window.ResetAt}
+		}
+	}
+	if exhausted {
+		rank.tier = soonestResetTierExhausted
+	}
+	return rank
 }
 
 func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, blockReason, time.Time) {

@@ -22,6 +22,7 @@ const (
 	schedulerStrategyRoundRobin         schedulerStrategy = 1
 	schedulerStrategyFillFirst          schedulerStrategy = 2
 	schedulerStrategyWeightedRoundRobin schedulerStrategy = 3
+	schedulerStrategySoonestResetFirst  schedulerStrategy = 4
 )
 
 // scheduledState describes how an auth currently participates in a model shard.
@@ -77,6 +78,10 @@ type modelScheduler struct {
 	priorityOrder   []int
 	readyByPriority map[int]*readyBucket
 	blocked         cooldownQueue
+	// providerAuths is the owning provider's latest metadata per auth. Shard
+	// entries only refresh when a result targets this model, so quota-aware
+	// strategies read credential-level observations from here instead.
+	providerAuths map[string]*scheduledAuthMeta
 }
 
 // scheduledAuth stores the runtime scheduling state for a single auth inside a model shard.
@@ -170,6 +175,8 @@ func selectorStrategy(selector Selector) schedulerStrategy {
 		return schedulerStrategyFillFirst
 	case *WeightedRoundRobinSelector:
 		return schedulerStrategyWeightedRoundRobin
+	case *SoonestResetFirstSelector:
+		return schedulerStrategySoonestResetFirst
 	case nil, *RoundRobinSelector:
 		return schedulerStrategyRoundRobin
 	default:
@@ -527,6 +534,35 @@ func (s *authScheduler) pickMixedWithStrategy(ctx context.Context, providers []s
 			if picked != nil {
 				return picked, providerKey, nil
 			}
+		}
+		return nil, "", s.mixedUnavailableErrorLocked(normalized, model, predicate)
+	}
+
+	if strategy == schedulerStrategySoonestResetFirst {
+		var picked *scheduledAuth
+		var pickedRank soonestResetRank
+		pickedProvider := ""
+		for providerIndex, providerKey := range normalized {
+			shard := candidateShards[providerIndex]
+			if shard == nil {
+				continue
+			}
+			bucket := shard.readyByPriority[bestPriority]
+			if bucket == nil {
+				continue
+			}
+			candidate, rank := bucket.all.pickSoonestReset(predicate, now, shard.latestAuth)
+			if candidate == nil {
+				continue
+			}
+			if picked == nil || rank.before(pickedRank) {
+				picked = candidate
+				pickedRank = rank
+				pickedProvider = providerKey
+			}
+		}
+		if picked != nil && picked.auth != nil {
+			return picked.auth, pickedProvider, nil
 		}
 		return nil, "", s.mixedUnavailableErrorLocked(normalized, model, predicate)
 	}
@@ -1175,6 +1211,7 @@ func (p *providerScheduler) ensureModelLocked(modelKey string, now time.Time) *m
 		modelKey:        modelKey,
 		entries:         make(map[string]*scheduledAuth),
 		readyByPriority: make(map[int]*readyBucket),
+		providerAuths:   p.auths,
 	}
 	for _, meta := range p.auths {
 		if meta == nil || !meta.supportsModel(modelKey) {
@@ -1384,6 +1421,8 @@ func (m *modelScheduler) pickReadyAtPriorityLocked(preferWebsocket bool, priorit
 		picked = view.pickFirst(predicate)
 	case schedulerStrategyWeightedRoundRobin:
 		picked = view.pickWeighted(predicate)
+	case schedulerStrategySoonestResetFirst:
+		picked, _ = view.pickSoonestReset(predicate, time.Now(), m.latestAuth)
 	default:
 		picked = view.pickRoundRobin(predicate)
 	}
@@ -1647,6 +1686,46 @@ func (v *readyView) pickFirst(predicate func(*scheduledAuth) bool) *scheduledAut
 		}
 	}
 	return nil
+}
+
+// pickSoonestReset returns the ready entry whose quota window resets soonest,
+// keeping auth ID order on ties. latest resolves the freshest auth snapshot for
+// an entry so credential-level quota observations apply across model shards.
+func (v *readyView) pickSoonestReset(predicate func(*scheduledAuth) bool, now time.Time, latest func(*scheduledAuth) *Auth) (*scheduledAuth, soonestResetRank) {
+	var picked *scheduledAuth
+	var pickedRank soonestResetRank
+	for _, entry := range v.flat {
+		if entry == nil || entry.auth == nil {
+			continue
+		}
+		if predicate != nil && !predicate(entry) {
+			continue
+		}
+		auth := entry.auth
+		if latest != nil {
+			auth = latest(entry)
+		}
+		rank := soonestResetRankForAuth(auth, now)
+		if picked == nil || rank.before(pickedRank) {
+			picked = entry
+			pickedRank = rank
+		}
+	}
+	return picked, pickedRank
+}
+
+// latestAuth returns the provider-level snapshot for entry, falling back to the
+// shard's own copy.
+func (m *modelScheduler) latestAuth(entry *scheduledAuth) *Auth {
+	if entry == nil {
+		return nil
+	}
+	if m != nil && m.providerAuths != nil && entry.auth != nil {
+		if meta := m.providerAuths[entry.auth.ID]; meta != nil && meta.auth != nil {
+			return meta.auth
+		}
+	}
+	return entry.auth
 }
 
 // pickRoundRobin returns the next ready entry using flat round-robin traversal.
