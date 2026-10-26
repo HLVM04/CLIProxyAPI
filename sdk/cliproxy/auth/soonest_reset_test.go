@@ -73,22 +73,18 @@ func TestQuotaWindowsFromStateCodexResolvesRelativeReset(t *testing.T) {
 	}
 }
 
-func TestQuotaWindowRolledForwardAdvancesByPeriod(t *testing.T) {
+func TestQuotaWindowRolledForwardTreatsExpiredWindowAsUnstarted(t *testing.T) {
 	t.Parallel()
 
 	now := time.Unix(1_700_000_000, 0)
-	window := QuotaWindow{ID: "7d", UsedPercent: 80, ResetAt: now.Add(-25 * time.Hour), WindowMinutes: 24 * 60}
-	rolled := window.RolledForward(now)
-	if rolled.UsedPercent != 0 {
-		t.Fatalf("rolled used = %v, want 0", rolled.UsedPercent)
+	active := QuotaWindow{ID: "5h", UsedPercent: 40, ResetAt: now.Add(time.Hour), WindowMinutes: 300}
+	if rolled := active.RolledForward(now); rolled != active {
+		t.Fatalf("active window changed: %#v", rolled)
 	}
-	if want := now.Add(23 * time.Hour); !rolled.ResetAt.Equal(want) {
-		t.Fatalf("rolled reset = %v, want %v", rolled.ResetAt, want)
-	}
-
-	unknownPeriod := QuotaWindow{ID: "x", UsedPercent: 50, ResetAt: now.Add(-time.Minute)}.RolledForward(now)
-	if !unknownPeriod.ResetAt.IsZero() || unknownPeriod.UsedPercent != 0 {
-		t.Fatalf("rolled unknown-period window = %#v", unknownPeriod)
+	expired := QuotaWindow{ID: "5h", UsedPercent: 80, ResetAt: now.Add(-25 * time.Minute), WindowMinutes: 300}
+	rolled := expired.RolledForward(now)
+	if rolled.UsedPercent != 0 || !rolled.ResetAt.IsZero() || rolled.WindowMinutes != 300 {
+		t.Fatalf("expired window = %#v, want refilled with an unknown next reset", rolled)
 	}
 }
 
@@ -145,19 +141,30 @@ func TestSoonestResetFirstSelectorKeepsPriorityTiers(t *testing.T) {
 	}
 }
 
-func TestSoonestResetFirstSelectorRollsPastResetForward(t *testing.T) {
+func TestSoonestResetFirstSelectorRanksExpiredWindowAsUnstarted(t *testing.T) {
 	t.Parallel()
 
 	now := time.Now()
-	// The weekly window of "a" reset an hour ago, so its next reset is ~6 days out.
-	rolled := claudeQuotaAuth("a-rolled", 0.9, now.Add(-time.Hour))
-	fresh := claudeQuotaAuth("b-two-days", 0.2, now.Add(48*time.Hour))
-	got, errPick := (&SoonestResetFirstSelector{}).Pick(context.Background(), "claude", "", cliproxyexecutor.Options{}, []*Auth{rolled, fresh})
+	// Team seats only report a 5h session window. "a-idle" reset 30 minutes ago,
+	// so its next window has not opened; "b-active" is mid-window and must be
+	// drained first instead of opening a fresh window on the idle seat.
+	idle := &Auth{ID: "a-idle", Provider: "claude", Quota: QuotaState{ObservedAt: now.Add(-5 * time.Hour), Signals: map[string]string{
+		"Anthropic-Ratelimit-Unified-5h-Utilization": "0.9",
+		"Anthropic-Ratelimit-Unified-5h-Reset":       strconv.FormatInt(now.Add(-30*time.Minute).Unix(), 10),
+	}}}
+	active := &Auth{ID: "b-active", Provider: "claude", Quota: QuotaState{ObservedAt: now, Signals: map[string]string{
+		"Anthropic-Ratelimit-Unified-5h-Utilization": "0.3",
+		"Anthropic-Ratelimit-Unified-5h-Reset":       strconv.FormatInt(now.Add(4*time.Hour).Unix(), 10),
+	}}}
+	got, errPick := (&SoonestResetFirstSelector{}).Pick(context.Background(), "claude", "", cliproxyexecutor.Options{}, []*Auth{idle, active})
 	if errPick != nil {
 		t.Fatalf("Pick() error = %v", errPick)
 	}
-	if got.ID != "b-two-days" {
-		t.Fatalf("Pick() = %q, want b-two-days", got.ID)
+	if got.ID != "b-active" {
+		t.Fatalf("Pick() = %q, want b-active", got.ID)
+	}
+	if tier, _ := SoonestResetFirstRank(idle, now); tier != "unknown" {
+		t.Fatalf("idle tier = %q, want unknown", tier)
 	}
 }
 

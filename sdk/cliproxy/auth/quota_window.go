@@ -39,20 +39,15 @@ func (w QuotaWindow) Length() time.Duration {
 }
 
 // RolledForward projects the window to now. A window whose reset already passed
-// has refilled, so its usage drops to zero and, when the window length is known,
-// the reset advances by whole periods; otherwise the reset becomes unknown.
+// has refilled, so its usage drops to zero and its next reset becomes unknown:
+// Claude session windows and Codex windows only open on the next request, so
+// guessing reset+period would make an idle credential look like it resets soon.
 func (w QuotaWindow) RolledForward(now time.Time) QuotaWindow {
 	if w.ResetAt.IsZero() || w.ResetAt.After(now) {
 		return w
 	}
 	w.UsedPercent = 0
-	period := w.Length()
-	if period <= 0 {
-		w.ResetAt = time.Time{}
-		return w
-	}
-	elapsed := now.Sub(w.ResetAt)
-	w.ResetAt = w.ResetAt.Add((elapsed/period + 1) * period)
+	w.ResetAt = time.Time{}
 	return w
 }
 
@@ -109,7 +104,8 @@ func claudeQuotaWindows(signals map[string]string) []QuotaWindow {
 		}
 		window := QuotaWindow{ID: spec.id, WindowMinutes: spec.minutes}
 		if okUtilization {
-			window.UsedPercent = clampPercent(utilization * 100)
+			// Headers carry a 0..1 fraction; round away float noise like 7.000000000000001.
+			window.UsedPercent = clampPercent(math.Round(utilization*10000) / 100)
 		}
 		if okReset {
 			window.ResetAt = reset
